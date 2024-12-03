@@ -1,0 +1,156 @@
+name: Trivy Security Scan
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+    steps:
+      # Checkout with manual retry logic
+      - name: Checkout with retry
+        run: |
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Attempting to clone repository (Attempt $((RETRY_COUNT+1)) of $MAX_RETRIES)"
+            
+            if git clone --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" .; then
+              echo "Successfully cloned repository"
+              exit 0
+            fi
+            
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "Clone failed. Waiting 30 seconds before retry..."
+              sleep 30
+            fi
+          done
+          
+          echo "Failed to clone repository after $MAX_RETRIES attempts"
+          exit 1
+
+      # Test network connectivity
+      - name: Test network connectivity
+        run: |
+          echo "Testing connection to github.com..."
+          for i in {1..5}; do
+            if curl -s -m 30 https://github.com; then
+              echo "Connection successful"
+              exit 0
+            else
+              echo "Attempt $i failed. Waiting 30 seconds..."
+              sleep 30
+            fi
+          done
+          echo "Unable to establish connection to github.com"
+          exit 1
+
+      # Cache Trivy vulnerability database
+      - name: Cache Trivy vulnerability database
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/trivy
+          key: ${{ runner.os }}-trivy-db-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-trivy-db-
+
+      # Install Trivy
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+
+      # Download Trivy DB with retry logic
+      - name: Download Trivy DB
+        run: |
+          max_attempts=5
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt to download Trivy DB..."
+            if trivy --cache-dir ~/.cache/trivy image --db-repository public.ecr.aws/aquasecurity/trivy-db --java-db-repository public.ecr.aws/aquasecurity/trivy-java-db --download-db-only --timeout 5m; then
+              echo "Successfully downloaded Trivy DB"
+              break
+            fi
+            attempt=$((attempt + 1))
+            if [ $attempt -le $max_attempts ]; then
+              sleep_time=$((attempt * 30))
+              echo "Failed to download DB. Waiting ${sleep_time} seconds before retry..."
+              sleep $sleep_time
+            fi
+          done
+          if [ $attempt -gt $max_attempts ]; then
+            echo "Failed to download Trivy DB after $max_attempts attempts"
+            exit 1
+          fi
+
+      # Run Trivy scan with both CycloneDX and regular JSON output
+      - name: Run Trivy vulnerability scanner
+        run: |
+          # Generate CycloneDX SBOM
+          trivy filesystem \
+            --cache-dir ~/.cache/trivy \
+            --format cyclonedx \
+            --output cyclonedx-bom.json \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+            --vuln-type os,library \
+            --scanners vuln \
+            --skip-db-update \
+            --timeout 10m \
+            .
+          
+          # Also generate regular JSON for summary
+          trivy filesystem \
+            --cache-dir ~/.cache/trivy \
+            --format json \
+            --output trivy-results.json \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+            --vuln-type os,library \
+            --scanners vuln \
+            --skip-db-update \
+            --timeout 10m \
+            .
+
+      # Upload scan results as artifacts
+      - name: Upload Trivy scan results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: trivy-scan-results
+          path: |
+            cyclonedx-bom.json
+            trivy-results.json
+          retention-days: 90
+
+      # Display scan results summary
+      - name: Display Scan Results
+        if: always()
+        run: |
+          echo "Scan Completed. Summary:"
+          if [ -f trivy-results.json ]; then
+            echo "Regular JSON results:"
+            if jq -e '.Results[] | select(.Vulnerabilities)' trivy-results.json > /dev/null; then
+            jq -r '.Results[] | select(.Vulnerabilities) | .Vulnerabilities | length' trivy-results.json | awk '{sum+=$1} END {print "Total vulnerabilities: "sum}'
+            else
+              echo "No vulnerabilities found"
+            fi
+          else
+            echo "No results file found"
+          fi
+          
+          if [ -f cyclonedx-bom.json ]; then
+            echo -e "\nCycloneDX SBOM generated successfully"
+            echo "SBOM format version: $(jq -r '.bomFormat + " v" + .specVersion' cyclonedx-bom.json)"
+            echo "Number of components: $(jq -r '.components | length' cyclonedx-bom.json)"
+            echo "Number of vulnerabilities: $(jq -r '.vulnerabilities | length // 0' cyclonedx-bom.json)"
+          else
+            echo "CycloneDX SBOM file not found"
+          fi
