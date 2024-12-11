@@ -1,6 +1,6 @@
 name: build
 on:
-  workflow_dispatch:    # Add this to enable manual triggering
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -21,6 +21,10 @@ jobs:
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL'
+          scan-ref: '.'  # Explicitly specify current directory
+          fs-skip-dirs: ''  # Don't skip any directories
+          java-db-repository: 'https://github.com/aquasecurity/trivy-java-db'  # Add Java vulnerability database
+          timeout: '10m'  # Increase timeout if needed
           
       - name: Upload Trivy scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
