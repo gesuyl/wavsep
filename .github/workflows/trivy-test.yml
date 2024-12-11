@@ -1,87 +1,27 @@
-name: Trivy Security Scan
-
+name: build
 on:
-  workflow_dispatch:
-
+  push:
+    branches:
+      - main
+  pull_request:
 jobs:
-  scan:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: read
-      security-events: write
-
+  build:
+    name: Build
+    runs-on: ubuntu-20.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner in repo mode
+        uses: aquasecurity/trivy-action@0.28.0
         with:
-          fetch-depth: 0
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL'
 
-      - name: Debug Repository Content
-        run: |
-          echo "Current directory contents:"
-          ls -la
-          echo -e "\nJava files found:"
-          find . -name "*.java" -o -name "*.class" -o -name "*.jsp"
-          echo -e "\nChecking for Java build files:"
-          find . -name "pom.xml" -o -name "build.gradle"
-
-      - name: Cache Trivy vulnerability database
-        uses: actions/cache@v3
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
         with:
-          path: ~/.cache/trivy
-          key: ${{ runner.os }}-trivy-db-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-trivy-db-
-
-      - name: Install Trivy
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
-
-      # Run Trivy scan specifically for Java
-      - name: Run Trivy vulnerability scanner
-        run: |
-          echo "Running Trivy scan for Java files..."
-          trivy fs \
-            --cache-dir ~/.cache/trivy \
-            --format cyclonedx \
-            --output cyclonedx-bom.json \
-            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
-            --java \
-            --scanners vuln \
-            --skip-db-update \
-            --timeout 10m \
-            -v \
-            .
-
-          echo -e "\nTrivy exit code: $?"
-          
-          if [ -f cyclonedx-bom.json ]; then
-            echo -e "\nSBOM file size: $(ls -lh cyclonedx-bom.json | awk '{print $5}')"
-            echo -e "\nFirst 1000 bytes of SBOM:"
-            head -c 1000 cyclonedx-bom.json
-          else
-            echo -e "\nSBOM file was not created"
-          fi
-
-      - name: Upload Trivy scan results
-        if: always()
-        uses: actions/upload-artifact@v3
-        with:
-          name: trivy-scan-results
-          path: cyclonedx-bom.json
-          retention-days: 90
-
-      # Add summary of findings
-      - name: Summary
-        if: always()
-        run: |
-          if [ -f cyclonedx-bom.json ]; then
-            echo "Scan completed. SBOM generated with CycloneDX format"
-            echo "Components found: $(jq '.components | length' cyclonedx-bom.json)"
-            echo "Vulnerabilities found: $(jq '.vulnerabilities | length' cyclonedx-bom.json)"
-          else
-            echo "No SBOM was generated. Check the scan logs for errors."
-          fi
+          sarif_file: 'trivy-results.sarif'
